@@ -9,3 +9,5 @@ add_subdirectory(src/injector)
 add_subdirectory(src/hyperion)
 add_subdirectory(src/core)
 add_subdirectory(src/launcher)
+add_subdirectory(tests/payload)
+

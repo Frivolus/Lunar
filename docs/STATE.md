@@ -6,8 +6,8 @@
 ## Position
 
 - Phase : 0 — fondations
-- Derniere action : injecteur ecrit (process, hijack, manual map, unlink PEB)
-- Prochaine action : corriger les erreurs de compilation injecteur
+- Derniere action : injecteur compile, DLL de test et CLI multi-cible ajoutes
+- Prochaine action : valider injection de bout en bout sur notepad.exe
 
 ## Fait
 
@@ -46,4 +46,5 @@
 
 - 30/10/2026 : scaffold, conventions posees, rien de fonctionnel.
 - 30/10/2026 : injecteur ecrit, API ntdll resolue dynamiquement. Manque : TLS callbacks, unlink arbre LdrpModuleIndexBase, syscalls indirects.
+- 30/10/2026 : compilation verte. DLL de test + CLI --exe/--pid.
 
