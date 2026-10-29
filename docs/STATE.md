@@ -6,8 +6,8 @@
 ## Position
 
 - Phase : 0 — fondations
-- Derniere action : scaffold initial (arborescence, cmake, gitignore, readme)
-- Prochaine action : injecteur manual map + hijack de thread + unlink PEB
+- Derniere action : injecteur ecrit (process, hijack, manual map, unlink PEB)
+- Prochaine action : corriger les erreurs de compilation injecteur
 
 ## Fait
 
@@ -18,7 +18,7 @@
 
 ## A faire (ordre impose)
 
-- [ ] `src/injector` : open process, hijack thread, manual map, stub restauration
+- [x] `src/injector` ecrit, non compile
 - [ ] `src/hyperion` : snapshot pages, hook VirtualProtect, anti-debug
 - [ ] `src/core` : VM Luau, ScriptContext, identity 7
 - [ ] `src/core/api` : 86 fonctions sUNC
@@ -45,3 +45,5 @@
 ## Journal
 
 - 30/10/2026 : scaffold, conventions posees, rien de fonctionnel.
+- 30/10/2026 : injecteur ecrit, API ntdll resolue dynamiquement. Manque : TLS callbacks, unlink arbre LdrpModuleIndexBase, syscalls indirects.
+
