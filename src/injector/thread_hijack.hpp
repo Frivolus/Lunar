@@ -15,6 +15,9 @@ struct Hijack {
     Hijack() = default;
     Hijack(const Hijack&) = delete;
     Hijack& operator=(const Hijack&) = delete;
+    Hijack(Hijack&& other) noexcept;
+    Hijack& operator=(Hijack&& other) noexcept;
+
     explicit operator bool() const { return thread != nullptr; }
 };
 

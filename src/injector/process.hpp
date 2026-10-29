@@ -20,6 +20,7 @@ struct ProcessHandle {
 
 std::uint32_t find_pid(const wchar_t* exe_name);
 ProcessHandle open_process(std::uint32_t pid);
-std::uintptr_t remote_module_base(const ProcessHandle& proc, const wchar_t* module_name);
+std::uintptr_t remote_module_base(HANDLE proc, const wchar_t* module_name);
 
 }
+

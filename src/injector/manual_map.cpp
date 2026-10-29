@@ -111,7 +111,7 @@ bool apply_imports(HANDLE proc, std::uintptr_t base, const std::uint8_t* image) 
         wchar_t wide[128]{};
         MultiByteToWideChar(CP_ACP, 0, module_name, -1, wide, 128);
 
-        const auto module = remote_module_base(ProcessHandle{ proc, GetProcessId(proc) }, wide);
+        const auto module = remote_module_base(proc, wide);
         if (!module) return false;
 
         const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(
@@ -214,3 +214,4 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
 }
 
 }
+

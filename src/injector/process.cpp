@@ -63,8 +63,8 @@ ProcessHandle open_process(std::uint32_t pid) {
     return out;
 }
 
-std::uintptr_t remote_module_base(const ProcessHandle& proc, const wchar_t* module_name) {
-    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, proc.pid);
+std::uintptr_t remote_module_base(HANDLE proc, const wchar_t* module_name) {
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(proc));
     if (snap == INVALID_HANDLE_VALUE) return 0;
 
     MODULEENTRY32W entry{};
@@ -85,3 +85,4 @@ std::uintptr_t remote_module_base(const ProcessHandle& proc, const wchar_t* modu
 }
 
 }
+

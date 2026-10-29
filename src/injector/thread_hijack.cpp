@@ -68,6 +68,35 @@ HANDLE pick_thread(std::uint32_t pid) {
 
 }
 
+Hijack::Hijack(Hijack&& other) noexcept
+    : proc(other.proc), thread(other.thread), stub(other.stub),
+      flag(other.flag), done(other.done) {
+    other.proc = nullptr;
+    other.thread = nullptr;
+    other.stub = 0;
+    other.flag = 0;
+}
+
+Hijack& Hijack::operator=(Hijack&& other) noexcept {
+    if (this != &other) {
+        if (proc) {
+            if (stub) free_mem(proc, stub);
+            if (flag) free_mem(proc, flag);
+        }
+        if (thread) CloseHandle(thread);
+        proc = other.proc;
+        thread = other.thread;
+        stub = other.stub;
+        flag = other.flag;
+        done = other.done;
+        other.proc = nullptr;
+        other.thread = nullptr;
+        other.stub = 0;
+        other.flag = 0;
+    }
+    return *this;
+}
+
 Hijack::~Hijack() {
     if (proc) {
         if (stub) free_mem(proc, stub);
@@ -126,3 +155,4 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
 }
 
 }
+
