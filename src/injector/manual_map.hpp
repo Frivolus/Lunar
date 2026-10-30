@@ -9,6 +9,7 @@ struct MapResult {
     bool ok = false;
     std::uintptr_t base = 0;
     std::string error;
+    std::string stage;
 
     explicit operator bool() const { return ok; }
 };
@@ -16,3 +17,4 @@ struct MapResult {
 MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll, bool wipe_headers);
 
 }
+

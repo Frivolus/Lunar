@@ -5,6 +5,8 @@
 #include <string>
 
 int wmain(int argc, wchar_t** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     if (argc < 2) {
         std::printf("usage: lunar_inject_cli <dll> [--exe nom.exe] [--pid n] [--wipe]\n");
         return 1;
@@ -28,10 +30,13 @@ int wmain(int argc, wchar_t** argv) {
     auto process = lunar::injector::open_process(pid);
     if (!process) { std::printf("ouverture du pid %u refusee\n", pid); return 1; }
 
-    std::printf("cible pid %u, dll %ls\n", pid, dll.c_str());
+    std::printf("cible pid %u\n", pid);
     const auto result = lunar::injector::manual_map(process, dll, wipe);
 
-    if (!result) { std::printf("echec: %s\n", result.error.c_str()); return 1; }
+    if (!result) {
+        std::printf("echec a l'etape [%s] : %s\n", result.stage.c_str(), result.error.c_str());
+        return 1;
+    }
 
     std::printf("mappe a 0x%llX\n", static_cast<unsigned long long>(result.base));
     return 0;

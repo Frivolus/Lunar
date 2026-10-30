@@ -1,6 +1,7 @@
 ﻿#include "thread_hijack.hpp"
 #include "remote.hpp"
 #include "ntdll.hpp"
+#include <cstdio>
 #include <tlhelp32.h>
 #include <vector>
 
@@ -20,25 +21,28 @@ void emit_imm64(std::vector<std::uint8_t>& code, std::uint8_t rex,
     code.insert(code.end(), raw, raw + sizeof(value));
 }
 
-std::vector<std::uint8_t> build_stub(std::uintptr_t module_base, std::uintptr_t entry,
+std::vector<std::uint8_t> build_stub(std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t a2,
+                                     std::uintptr_t a3, std::uintptr_t slot,
                                      std::uintptr_t context, std::uintptr_t flag,
                                      std::uintptr_t nt_continue) {
     std::vector<std::uint8_t> code;
-    code.reserve(96);
+    code.reserve(128);
 
-    emit(code, { 0x48, 0x83, 0xE4, 0xF0 });                    // and rsp, -16
-    emit(code, { 0x48, 0x83, 0xEC, 0x20 });                    // sub rsp, 0x20
-    emit_imm64(code, 0x48, 0xB9, module_base);                 // mov rcx, module
-    emit(code, { 0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00 });  // mov rdx, 1
-    emit(code, { 0x45, 0x31, 0xC0 });                          // xor r8d, r8d
-    emit_imm64(code, 0x48, 0xB8, entry);                       // mov rax, entry
-    emit(code, { 0xFF, 0xD0 });                                // call rax
-    emit_imm64(code, 0x48, 0xB8, flag);                        // mov rax, flag
-    emit(code, { 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00 });        // mov dword [rax], 1
-    emit_imm64(code, 0x48, 0xB9, context);                     // mov rcx, context
-    emit(code, { 0x31, 0xD2 });                                // xor edx, edx
-    emit_imm64(code, 0x48, 0xB8, nt_continue);                 // mov rax, NtContinue
-    emit(code, { 0xFF, 0xD0 });                                // call rax
+    emit(code, { 0x48, 0x83, 0xE4, 0xF0 });
+    emit(code, { 0x48, 0x83, 0xEC, 0x20 });
+    emit_imm64(code, 0x48, 0xB9, a1);
+    emit_imm64(code, 0x48, 0xBA, a2);
+    emit_imm64(code, 0x49, 0xB8, a3);
+    emit_imm64(code, 0x48, 0xB8, fn);
+    emit(code, { 0xFF, 0xD0 });
+    emit_imm64(code, 0x48, 0xB9, slot);
+    emit(code, { 0x48, 0x89, 0x01 });
+    emit_imm64(code, 0x48, 0xB8, flag);
+    emit(code, { 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00 });
+    emit_imm64(code, 0x48, 0xB9, context);
+    emit(code, { 0x31, 0xD2 });
+    emit_imm64(code, 0x48, 0xB8, nt_continue);
+    emit(code, { 0xFF, 0xD0 });
 
     return code;
 }
@@ -66,15 +70,82 @@ HANDLE pick_thread(std::uint32_t pid) {
     return chosen;
 }
 
+bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t a2,
+              std::uintptr_t a3, std::uintptr_t* out_value) {
+    if (out_value) *out_value = 0;
+
+    Hijack out;
+    out.proc = proc;
+
+    out.thread = pick_thread(GetProcessId(proc));
+    if (!out.thread) { std::fprintf(stderr, "[trace] appel: aucun thread\n"); return false; }
+
+    if (SuspendThread(out.thread) == static_cast<DWORD>(-1)) {
+        std::fprintf(stderr, "[trace] appel: suspend echec\n");
+        CloseHandle(out.thread);
+        out.thread = nullptr;
+        return false;
+    }
+
+    CONTEXT original{};
+    original.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(out.thread, &original)) {
+        std::fprintf(stderr, "[trace] appel: getcontext echec\n");
+        ResumeThread(out.thread);
+        return false;
+    }
+
+    const auto nt_continue = nt::api().continue_thread;
+    if (!nt_continue) return false;
+
+    out.flag = alloc_mem(proc, 0x10, PAGE_READWRITE);
+    out.slot = alloc_mem(proc, 0x10, PAGE_READWRITE);
+    if (!out.flag || !out.slot) { std::fprintf(stderr, "[trace] appel: alloc echec\n"); return false; }
+
+    const std::uintptr_t context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
+    if (!context) return false;
+    if (!write_mem(proc, context, &original, sizeof(original))) return false;
+
+    auto code = build_stub(fn, a1, a2, a3, out.slot, context, out.flag,
+                           reinterpret_cast<std::uintptr_t>(nt_continue));
+
+    out.stub = alloc_mem(proc, code.size(), PAGE_EXECUTE_READWRITE);
+    if (!out.stub) { std::fprintf(stderr, "[trace] appel: stub echec\n"); return false; }
+    if (!write_mem(proc, out.stub, code.data(), code.size())) return false;
+
+    CONTEXT hijacked = original;
+    hijacked.Rip = static_cast<DWORD64>(out.stub);
+    if (!SetThreadContext(out.thread, &hijacked)) {
+        std::fprintf(stderr, "[trace] appel: setcontext echec\n");
+        ResumeThread(out.thread);
+        return false;
+    }
+
+    ResumeThread(out.thread);
+
+    bool done = false;
+    for (DWORD waited = 0; waited < kTimeoutMs; waited += 10) {
+        std::uint32_t value = 0;
+        if (read_value(proc, out.flag, value) && value == 1) { done = true; break; }
+        Sleep(10);
+    }
+
+    if (!done) { std::fprintf(stderr, "[trace] appel: timeout\n"); return false; }
+
+    if (out_value) read_value(proc, out.slot, *out_value);
+    return true;
+}
+
 }
 
 Hijack::Hijack(Hijack&& other) noexcept
     : proc(other.proc), thread(other.thread), stub(other.stub),
-      flag(other.flag), done(other.done) {
+      flag(other.flag), slot(other.slot), done(other.done) {
     other.proc = nullptr;
     other.thread = nullptr;
     other.stub = 0;
     other.flag = 0;
+    other.slot = 0;
 }
 
 Hijack& Hijack::operator=(Hijack&& other) noexcept {
@@ -82,17 +153,20 @@ Hijack& Hijack::operator=(Hijack&& other) noexcept {
         if (proc) {
             if (stub) free_mem(proc, stub);
             if (flag) free_mem(proc, flag);
+            if (slot) free_mem(proc, slot);
         }
         if (thread) CloseHandle(thread);
         proc = other.proc;
         thread = other.thread;
         stub = other.stub;
         flag = other.flag;
+        slot = other.slot;
         done = other.done;
         other.proc = nullptr;
         other.thread = nullptr;
         other.stub = 0;
         other.flag = 0;
+        other.slot = 0;
     }
     return *this;
 }
@@ -101,6 +175,7 @@ Hijack::~Hijack() {
     if (proc) {
         if (stub) free_mem(proc, stub);
         if (flag) free_mem(proc, flag);
+        if (slot) free_mem(proc, slot);
     }
     if (thread) CloseHandle(thread);
 }
@@ -126,13 +201,14 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
     if (!nt_continue) return out;
 
     out.flag = alloc_mem(proc, 0x10, PAGE_READWRITE);
-    if (!out.flag) return out;
+    out.slot = alloc_mem(proc, 0x10, PAGE_READWRITE);
+    if (!out.flag || !out.slot) return out;
 
     const std::uintptr_t context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
     if (!context) return out;
     if (!write_mem(proc, context, &original, sizeof(original))) return out;
 
-    auto code = build_stub(module_base, entry, context, out.flag,
+    auto code = build_stub(entry, module_base, 1, 0, out.slot, context, out.flag,
                            reinterpret_cast<std::uintptr_t>(nt_continue));
 
     out.stub = alloc_mem(proc, code.size(), PAGE_EXECUTE_READWRITE);
@@ -154,5 +230,10 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
     return out;
 }
 
+bool hijack_call(HANDLE proc, std::uintptr_t fn,
+                 std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3,
+                 std::uintptr_t* out_value) {
+    return run_stub(proc, fn, a1, a2, a3, out_value);
 }
 
+}
