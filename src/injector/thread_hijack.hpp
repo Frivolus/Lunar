@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <windows.h>
 #include <cstdint>
+#include <cstddef>
 
 namespace lunar::injector {
 
@@ -8,9 +9,12 @@ struct Hijack {
     HANDLE proc = nullptr;
     HANDLE thread = nullptr;
     std::uintptr_t stub = 0;
+    std::size_t stub_size = 0;
     std::uintptr_t flag = 0;
     std::uintptr_t slot = 0;
+    std::uintptr_t context = 0;
     bool done = false;
+    bool keep_remote = false;
 
     ~Hijack();
     Hijack() = default;
@@ -18,6 +22,8 @@ struct Hijack {
     Hijack& operator=(const Hijack&) = delete;
     Hijack(Hijack&& other) noexcept;
     Hijack& operator=(Hijack&& other) noexcept;
+
+    void release();
 
     explicit operator bool() const { return thread != nullptr; }
 };

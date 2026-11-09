@@ -9,6 +9,7 @@ namespace lunar::injector {
 namespace {
 
 constexpr DWORD kTimeoutMs = 5000;
+constexpr DWORD kExitGraceMs = 200;
 
 void emit(std::vector<std::uint8_t>& code, std::initializer_list<std::uint8_t> bytes) {
     code.insert(code.end(), bytes.begin(), bytes.end());
@@ -70,6 +71,44 @@ HANDLE pick_thread(std::uint32_t pid) {
     return chosen;
 }
 
+void abort_hijack(Hijack& out, bool suspended) {
+    if (out.thread) {
+        if (suspended) {
+            if (out.stub && out.context) {
+                CONTEXT original{};
+                original.ContextFlags = CONTEXT_FULL;
+                if (read_mem(out.proc, out.context, &original, sizeof(original)))
+                    SetThreadContext(out.thread, &original);
+            }
+            ResumeThread(out.thread);
+        }
+        CloseHandle(out.thread);
+        out.thread = nullptr;
+    }
+}
+
+bool wait_left_stub(Hijack& out) {
+    if (!out.stub || !out.stub_size) return true;
+
+    for (DWORD waited = 0; waited < kExitGraceMs; waited += 2) {
+        bool outside = false;
+        bool known = false;
+
+        if (SuspendThread(out.thread) != static_cast<DWORD>(-1)) {
+            CONTEXT current{};
+            current.ContextFlags = CONTEXT_CONTROL;
+            known = GetThreadContext(out.thread, &current) != FALSE;
+            ResumeThread(out.thread);
+
+            if (known) outside = current.Rip < out.stub || current.Rip >= out.stub + out.stub_size;
+        }
+
+        if (outside) return true;
+        Sleep(2);
+    }
+    return false;
+}
+
 bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t a2,
               std::uintptr_t a3, std::uintptr_t* out_value) {
     if (out_value) *out_value = 0;
@@ -82,46 +121,61 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
 
     if (SuspendThread(out.thread) == static_cast<DWORD>(-1)) {
         std::fprintf(stderr, "[trace] appel: suspend echec\n");
-        CloseHandle(out.thread);
-        out.thread = nullptr;
+        abort_hijack(out, false);
         return false;
     }
+    bool suspended = true;
 
     CONTEXT original{};
     original.ContextFlags = CONTEXT_FULL;
     if (!GetThreadContext(out.thread, &original)) {
         std::fprintf(stderr, "[trace] appel: getcontext echec\n");
-        ResumeThread(out.thread);
+        abort_hijack(out, suspended);
         return false;
     }
 
     const auto nt_continue = nt::api().continue_thread;
-    if (!nt_continue) return false;
+    if (!nt_continue) { abort_hijack(out, suspended); return false; }
 
     out.flag = alloc_mem(proc, 0x10, PAGE_READWRITE);
     out.slot = alloc_mem(proc, 0x10, PAGE_READWRITE);
-    if (!out.flag || !out.slot) { std::fprintf(stderr, "[trace] appel: alloc echec\n"); return false; }
+    if (!out.flag || !out.slot) {
+        std::fprintf(stderr, "[trace] appel: alloc echec\n");
+        abort_hijack(out, suspended);
+        return false;
+    }
 
-    const std::uintptr_t context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
-    if (!context) return false;
-    if (!write_mem(proc, context, &original, sizeof(original))) return false;
+    out.context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
+    if (!out.context || !write_mem(proc, out.context, &original, sizeof(original))) {
+        abort_hijack(out, suspended);
+        return false;
+    }
 
-    auto code = build_stub(fn, a1, a2, a3, out.slot, context, out.flag,
+    auto code = build_stub(fn, a1, a2, a3, out.slot, out.context, out.flag,
                            reinterpret_cast<std::uintptr_t>(nt_continue));
 
     out.stub = alloc_mem(proc, code.size(), PAGE_EXECUTE_READWRITE);
-    if (!out.stub) { std::fprintf(stderr, "[trace] appel: stub echec\n"); return false; }
-    if (!write_mem(proc, out.stub, code.data(), code.size())) return false;
+    if (!out.stub) {
+        std::fprintf(stderr, "[trace] appel: stub echec\n");
+        abort_hijack(out, suspended);
+        return false;
+    }
+    out.stub_size = code.size();
+    if (!write_mem(proc, out.stub, code.data(), code.size())) {
+        abort_hijack(out, suspended);
+        return false;
+    }
 
     CONTEXT hijacked = original;
     hijacked.Rip = static_cast<DWORD64>(out.stub);
     if (!SetThreadContext(out.thread, &hijacked)) {
         std::fprintf(stderr, "[trace] appel: setcontext echec\n");
-        ResumeThread(out.thread);
+        abort_hijack(out, suspended);
         return false;
     }
 
     ResumeThread(out.thread);
+    suspended = false;
 
     bool done = false;
     for (DWORD waited = 0; waited < kTimeoutMs; waited += 10) {
@@ -130,7 +184,17 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
         Sleep(10);
     }
 
-    if (!done) { std::fprintf(stderr, "[trace] appel: timeout\n"); return false; }
+    if (!done) {
+        std::fprintf(stderr, "[trace] appel: timeout\n");
+        out.keep_remote = true;
+        if (out_value) read_value(proc, out.slot, *out_value);
+        return false;
+    }
+
+    if (!wait_left_stub(out)) {
+        std::fprintf(stderr, "[trace] appel: sortie du stub non confirmee\n");
+        out.keep_remote = true;
+    }
 
     if (out_value) read_value(proc, out.slot, *out_value);
     return true;
@@ -138,46 +202,60 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
 
 }
 
+void Hijack::release() {
+    if (thread) CloseHandle(thread);
+    if (proc && !keep_remote) {
+        if (stub) free_mem(proc, stub);
+        if (flag) free_mem(proc, flag);
+        if (slot) free_mem(proc, slot);
+        if (context) free_mem(proc, context);
+    }
+    thread = nullptr;
+    stub = 0;
+    stub_size = 0;
+    flag = 0;
+    slot = 0;
+    context = 0;
+}
+
 Hijack::Hijack(Hijack&& other) noexcept
-    : proc(other.proc), thread(other.thread), stub(other.stub),
-      flag(other.flag), slot(other.slot), done(other.done) {
+    : proc(other.proc), thread(other.thread), stub(other.stub), stub_size(other.stub_size),
+      flag(other.flag), slot(other.slot), context(other.context),
+      done(other.done), keep_remote(other.keep_remote) {
     other.proc = nullptr;
     other.thread = nullptr;
     other.stub = 0;
+    other.stub_size = 0;
     other.flag = 0;
     other.slot = 0;
+    other.context = 0;
 }
 
 Hijack& Hijack::operator=(Hijack&& other) noexcept {
     if (this != &other) {
-        if (proc) {
-            if (stub) free_mem(proc, stub);
-            if (flag) free_mem(proc, flag);
-            if (slot) free_mem(proc, slot);
-        }
-        if (thread) CloseHandle(thread);
+        release();
         proc = other.proc;
         thread = other.thread;
         stub = other.stub;
+        stub_size = other.stub_size;
         flag = other.flag;
         slot = other.slot;
+        context = other.context;
         done = other.done;
+        keep_remote = other.keep_remote;
         other.proc = nullptr;
         other.thread = nullptr;
         other.stub = 0;
+        other.stub_size = 0;
         other.flag = 0;
         other.slot = 0;
+        other.context = 0;
     }
     return *this;
 }
 
 Hijack::~Hijack() {
-    if (proc) {
-        if (stub) free_mem(proc, stub);
-        if (flag) free_mem(proc, flag);
-        if (slot) free_mem(proc, slot);
-    }
-    if (thread) CloseHandle(thread);
+    release();
 }
 
 Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t entry) {
@@ -188,44 +266,54 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
     if (!out.thread) return out;
 
     if (SuspendThread(out.thread) == static_cast<DWORD>(-1)) {
-        CloseHandle(out.thread);
-        out.thread = nullptr;
+        abort_hijack(out, false);
         return out;
     }
+    bool suspended = true;
 
     CONTEXT original{};
     original.ContextFlags = CONTEXT_FULL;
-    if (!GetThreadContext(out.thread, &original)) return out;
+    if (!GetThreadContext(out.thread, &original)) {
+        abort_hijack(out, suspended);
+        return out;
+    }
 
     const auto nt_continue = nt::api().continue_thread;
-    if (!nt_continue) return out;
+    if (!nt_continue) { abort_hijack(out, suspended); return out; }
 
     out.flag = alloc_mem(proc, 0x10, PAGE_READWRITE);
     out.slot = alloc_mem(proc, 0x10, PAGE_READWRITE);
-    if (!out.flag || !out.slot) return out;
+    if (!out.flag || !out.slot) { abort_hijack(out, suspended); return out; }
 
-    const std::uintptr_t context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
-    if (!context) return out;
-    if (!write_mem(proc, context, &original, sizeof(original))) return out;
+    out.context = alloc_mem(proc, sizeof(CONTEXT), PAGE_READWRITE);
+    if (!out.context || !write_mem(proc, out.context, &original, sizeof(original))) {
+        abort_hijack(out, suspended);
+        return out;
+    }
 
-    auto code = build_stub(entry, module_base, 1, 0, out.slot, context, out.flag,
+    auto code = build_stub(entry, module_base, 1, 0, out.slot, out.context, out.flag,
                            reinterpret_cast<std::uintptr_t>(nt_continue));
 
     out.stub = alloc_mem(proc, code.size(), PAGE_EXECUTE_READWRITE);
-    if (!out.stub) return out;
-    if (!write_mem(proc, out.stub, code.data(), code.size())) return out;
+    if (!out.stub) { abort_hijack(out, suspended); return out; }
+    out.stub_size = code.size();
+    if (!write_mem(proc, out.stub, code.data(), code.size())) { abort_hijack(out, suspended); return out; }
 
     CONTEXT hijacked = original;
     hijacked.Rip = static_cast<DWORD64>(out.stub);
-    if (!SetThreadContext(out.thread, &hijacked)) return out;
+    if (!SetThreadContext(out.thread, &hijacked)) { abort_hijack(out, suspended); return out; }
 
     ResumeThread(out.thread);
+    suspended = false;
 
     for (DWORD waited = 0; waited < kTimeoutMs; waited += 10) {
         std::uint32_t value = 0;
         if (read_value(proc, out.flag, value) && value == 1) { out.done = true; break; }
         Sleep(10);
     }
+
+    if (!out.done) { out.keep_remote = true; return out; }
+    if (!wait_left_stub(out)) out.keep_remote = true;
 
     return out;
 }
