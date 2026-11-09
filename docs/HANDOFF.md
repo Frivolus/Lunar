@@ -89,3 +89,11 @@ Brique 1 : patch `thread_hijack.cpp` (chemins d'erreur, duree de vie du stub, li
 - Injection complete du payload brut sur `lunar_spin` : mappe, DllMain execute, marqueur ecrit, unlink PEB, cible vivante.
 - Le mapper, le stub, NtContinue, les imports et les exceptions fonctionnent.
 - Reste : payload CRT, puis selection de thread robuste (ignorer les threads bloques).
+
+## Mise a jour 09/11/2026 (3)
+
+- Cause du crash CRT identifiee : `EnterCriticalSection` est un forwarder d'export. Le resolveur renvoyait l'RVA du forwarder, qui pointe dans `.edata` (non executable) -> violation DEP (info0=8).
+- `resolve_export` suit desormais les forwarders : detection par RVA dans la plage du repertoire d'export, lecture de la chaine "DLL.Fonction", chargement de l'hote, resolution recursive, garde de profondeur 8.
+- Payload CRT injecte avec succes : DllMain rend la main, marqueur ecrit, unlink PEB, cible vivante.
+- Le mapper gere maintenant les DLL a CRT complet.
+- Prochain chantier : selection de thread robuste.

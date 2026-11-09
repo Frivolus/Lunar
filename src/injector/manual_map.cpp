@@ -126,9 +126,12 @@ bool apply_relocations(HANDLE proc, std::uintptr_t base, const std::uint8_t* ima
     return true;
 }
 
-std::uintptr_t resolve_export(HANDLE proc, std::uintptr_t module,
-                              const char* name, std::uint16_t ordinal_hint) {
+bool load_remote(HANDLE proc, const wchar_t* name, std::uintptr_t& out_module);
+
+std::uintptr_t resolve_export_depth(HANDLE proc, std::uintptr_t module,
+                                    const char* name, std::uint16_t ordinal_hint, int depth) {
     if (!module) return 0;
+    if (depth > 8) return 0;
 
     IMAGE_DOS_HEADER dos{};
     if (!read_value(proc, module, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
@@ -144,6 +147,38 @@ std::uintptr_t resolve_export(HANDLE proc, std::uintptr_t module,
     if (!read_value(proc, module + export_dir.VirtualAddress, dir)) return 0;
     if (!dir.NumberOfFunctions || !dir.NumberOfNames) return 0;
 
+    // Un export qui pointe dans .edata est un forwarder "DLL.Fonction".
+    // Renvoyer son RVA tel quel ferait executer une page non executable.
+    auto finish = [&](std::uint32_t rva) -> std::uintptr_t {
+        const auto first = static_cast<std::uint32_t>(export_dir.VirtualAddress);
+        const auto last = first + static_cast<std::uint32_t>(export_dir.Size);
+        if (rva < first || rva >= last) return module + rva;
+
+        char forwarder[256]{};
+        if (!read_mem(proc, module + rva, forwarder, sizeof(forwarder) - 1)) return 0;
+
+        char* dot = std::strchr(forwarder, '.');
+        if (!dot) return 0;
+        *dot = 0;
+
+        wchar_t host_name[128]{};
+        MultiByteToWideChar(CP_ACP, 0, forwarder, -1, host_name, 128);
+
+        std::uintptr_t host = remote_module_base(proc, host_name);
+        if (!host) {
+            std::wstring with_ext = host_name;
+            if (with_ext.find(L'.') == std::wstring::npos) with_ext += L".dll";
+            std::uintptr_t loaded = 0;
+            if (load_remote(proc, with_ext.c_str(), loaded)) host = loaded;
+        }
+        if (!host) {
+            std::fprintf(stderr, "[trace] forwarder non resolu : %s\n", forwarder);
+            return 0;
+        }
+
+        return resolve_export_depth(proc, host, dot + 1, 0, depth + 1);
+    };
+
     std::vector<std::uint32_t> funcs(dir.NumberOfFunctions);
     if (!read_mem(proc, module + dir.AddressOfFunctions,
                   funcs.data(), funcs.size() * sizeof(std::uint32_t))) return 0;
@@ -151,7 +186,7 @@ std::uintptr_t resolve_export(HANDLE proc, std::uintptr_t module,
     if (!name) {
         const auto index = static_cast<std::size_t>(ordinal_hint - dir.Base);
         if (index >= funcs.size()) return 0;
-        return module + funcs[index];
+        return finish(funcs[index]);
     }
 
     std::vector<std::uint32_t> names(dir.NumberOfNames);
@@ -166,9 +201,14 @@ std::uintptr_t resolve_export(HANDLE proc, std::uintptr_t module,
         if (!read_mem(proc, module + names[i], buffer, sizeof(buffer) - 1)) continue;
         if (std::strcmp(buffer, name) != 0) continue;
         if (ordinals[i] >= funcs.size()) return 0;
-        return module + funcs[ordinals[i]];
+        return finish(funcs[ordinals[i]]);
     }
     return 0;
+}
+
+std::uintptr_t resolve_export(HANDLE proc, std::uintptr_t module,
+                              const char* name, std::uint16_t ordinal_hint) {
+    return resolve_export_depth(proc, module, name, ordinal_hint, 0);
 }
 
 bool load_remote(HANDLE proc, const wchar_t* name, std::uintptr_t& out_module) {
@@ -457,7 +497,7 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
     {
         const auto add_veh = reinterpret_cast<std::uintptr_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlAddVectoredExceptionHandler"));
-        veh_report = alloc_mem(proc.handle, 0x20, PAGE_READWRITE);
+        veh_report = alloc_mem(proc.handle, 0x40, PAGE_READWRITE);
 
         std::vector<std::uint8_t> handler;
         auto imm = [&](std::uintptr_t value) {
@@ -468,6 +508,9 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
         // magic
         imm(veh_report); handler.push_back(0xC7); handler.push_back(0x00);
         handler.push_back(0xEF); handler.push_back(0xBE); handler.push_back(0xAD); handler.push_back(0xDE);
+        // exception record
+        handler.push_back(0x48); handler.push_back(0x8B); handler.push_back(0x11);
+        imm(veh_report + 32); handler.push_back(0x48); handler.push_back(0x89); handler.push_back(0x10);
         // context
         const std::uint8_t a[] = { 0x48, 0x8B, 0x41, 0x08, 0x48, 0x8B, 0x90, 0xF8, 0x00, 0x00, 0x00 };
         handler.insert(handler.end(), a, a + sizeof(a));
@@ -494,12 +537,20 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
 
     auto hijack = hijack_thread(proc.handle, base, base + nt->OptionalHeader.AddressOfEntryPoint);
     if (!hijack.done) {
-        std::uint32_t magic = 0, fault_code = 0;
-        std::uintptr_t fault_rip = 0;
+        std::uint32_t magic = 0, fault_code = 0, fault_flags = 0, fault_params = 0;
+        std::uintptr_t fault_rip = 0, fault_addr = 0, er = 0, info0 = 0, info1 = 0;
         if (veh_report) {
             read_value(proc.handle, veh_report, magic);
             read_value(proc.handle, veh_report + 8, fault_rip);
-            read_value(proc.handle, veh_report + 16, fault_code);
+            read_value(proc.handle, veh_report + 32, er);
+            if (er) {
+                read_value(proc.handle, er, fault_code);
+                read_value(proc.handle, er + 0x04, fault_flags);
+                read_value(proc.handle, er + 0x10, fault_addr);
+                read_value(proc.handle, er + 0x18, fault_params);
+                read_value(proc.handle, er + 0x20, info0);
+                read_value(proc.handle, er + 0x28, info1);
+            }
         }
         unsigned char entry_bytes[16]{};
         read_mem(proc.handle, base + nt->OptionalHeader.AddressOfEntryPoint, entry_bytes, sizeof(entry_bytes));
@@ -613,8 +664,11 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
             }
             CloseHandle(snap);
             return out;
-        };        std::fprintf(stderr, "[trace] magic=0x%X code=0x%X rip=%ls entree=0x%llX\n",
-                     magic, fault_code, describe(fault_rip).c_str(),
+        };        std::fprintf(stderr, "[trace] magic=0x%X code=0x%08X flags=0x%X addr=0x%llX nparams=%u\n",
+                     magic, fault_code, fault_flags, (unsigned long long)fault_addr, fault_params);
+        std::fprintf(stderr, "[trace] info0=0x%llX info1=0x%llX rip=%ls entree=0x%llX\n",
+                     (unsigned long long)info0, (unsigned long long)info1,
+                     describe(fault_rip).c_str(),
                      (unsigned long long)(base + nt->OptionalHeader.AddressOfEntryPoint));
 
         std::uintptr_t fault_rsp = 0;

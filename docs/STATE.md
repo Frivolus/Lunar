@@ -6,8 +6,8 @@
 ## Position
 
 - Phase : 0 — fondations
-- Derniere action : injection bout en bout validee (payload brut, cible `lunar_spin`), DllMain execute, marqueur ecrit, unlink PEB fait
-- Prochaine action : valider le payload CRT, puis rendre la selection de thread robuste aux threads bloques
+- Derniere action : payload CRT injecte avec succes, forwarders d'export resolus
+- Prochaine action : selection de thread robuste (ignorer les threads bloques, essayer les suivants)
 
 ## Fait
 
@@ -15,13 +15,15 @@
 - [x] `src/injector` ecrit, compile
 - [x] Chemins d'erreur hijack + duree de vie du stub
 - [x] Relocations, imports, remap API-set, chargement d'import par chemin
+- [x] Resolution des forwarders d'export (sinon DEP dans .edata)
 - [x] Table d'exceptions (.pdata) via RtlAddFunctionTable
 - [x] TLS : LdrpHandleTlsData + callbacks manuels
 - [x] Detour RtlPcToFileHeader
-- [x] VEH de diagnostic
-- [x] `--selftest` : hijack de GetCurrentProcessId, valeur remontee correcte
-- [x] Cible de test `lunar_spin` (thread jamais bloque)
+- [x] VEH de diagnostic complet (EXCEPTION_RECORD)
+- [x] `--selftest`
+- [x] Cible de test `lunar_spin`
 - [x] Injection complete du payload brut : DllMain, marqueur, unlink PEB
+- [x] Injection complete du payload CRT : DllMain, marqueur, unlink PEB
 
 ## Limite connue
 
@@ -29,8 +31,7 @@ Un thread bloque dans un wait noyau (ex. thread principal de `cmd.exe` en attent
 
 ## A faire (ordre impose)
 
-- [ ] Payload CRT sur `lunar_spin`
-- [ ] Selection de thread robuste : ignorer les threads bloques, essayer les suivants
+- [ ] Selection de thread robuste : detecter les threads bloques, passer au suivant
 - [ ] `src/hyperion` : snapshot pages, hook VirtualProtect, anti-debug
 - [ ] `src/core` : VM Luau, ScriptContext, identity 7
 - [ ] `src/core/api` : 86 fonctions sUNC
@@ -67,3 +68,4 @@ Un thread bloque dans un wait noyau (ex. thread principal de `cmd.exe` en attent
 - 09/11/2026 : chemins d'erreur hijack, duree de vie du stub.
 - 09/11/2026 : TLS, exceptions, detour RtlPcToFileHeader, VEH diagnostic, payload brut.
 - 09/11/2026 : cause du timeout identifiee (thread bloque), selftest ajoute, injection bout en bout OK.
+- 09/11/2026 : forwarders d'export resolus, payload CRT injecte avec succes.
