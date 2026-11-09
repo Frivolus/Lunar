@@ -1,1 +1,2 @@
 ﻿add_library(lunar_payload_test SHARED payload.cpp)
+set_target_properties(lunar_payload_test PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded")

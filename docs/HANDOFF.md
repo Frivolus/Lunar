@@ -74,3 +74,10 @@ Brique 1 : patch `thread_hijack.cpp` (chemins d'erreur, duree de vie du stub, li
 - 30/10/2026 : compilation verte, DLL de test, CLI multi-cible.
 - 30/10/2026 : fix signature hijack_call.
 - 09/11/2026 : audit complet de l'injecteur, 5 bloquants releves, mise en place du protocole de passation.
+## Mise a jour 09/11/2026
+
+- Brique 1 (patch hijack) : faite, compilation verte, commit e6f2d8c.
+- WIP de debug d'une session precedente retrouve non commite : TLS, table d'exceptions, detour RtlPcToFileHeader, VEH diagnostic, payload brut /NODEFAULTLIB, chargement d'import par chemin. Commite tel quel.
+- Echec observe : `DllMain n'a pas rendu la main`. Le VEH de diagnostic est en place pour capturer code/rip/rsp/pile.
+- Prochain test : payload brut dans notepad.exe. Si le brut passe et le CRT non, c'est l'initialisation CRT. Si les deux echouent, c'est le mapper.
+- Les payloads de test ecrivent desormais en dur : `C:\dev\lunar_payload_ok.txt` et `%TEMP%\lunar_raw_ok.txt`.

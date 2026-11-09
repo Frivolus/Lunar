@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <tlhelp32.h>
 #include <fstream>
 #include <vector>
 
@@ -12,6 +13,7 @@ namespace lunar::injector {
 namespace {
 
 constexpr std::size_t kMaxImage = 256u * 1024u * 1024u;
+std::filesystem::path g_dll_dir;
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -94,6 +96,7 @@ bool apply_relocations(HANDLE proc, std::uintptr_t base, const std::uint8_t* ima
     if (static_cast<std::size_t>(reloc->VirtualAddress) >= image_size) return false;
 
     std::size_t offset = 0;
+    std::size_t patched = 0;
     while (offset + sizeof(IMAGE_BASE_RELOCATION) <= reloc->Size) {
         const auto block_offset = static_cast<std::size_t>(reloc->VirtualAddress) + offset;
         if (block_offset + sizeof(IMAGE_BASE_RELOCATION) > image_size) break;
@@ -114,10 +117,12 @@ bool apply_relocations(HANDLE proc, std::uintptr_t base, const std::uint8_t* ima
             if (!read_value(proc, patch, value)) return false;
             value = static_cast<std::uint64_t>(static_cast<std::int64_t>(value) + delta);
             if (!write_value(proc, patch, value)) return false;
+            ++patched;
         }
 
         offset += block->SizeOfBlock;
     }
+    std::fprintf(stderr, "[trace] relocations appliquees: %zu", patched); std::fprintf(stderr, "\n");
     return true;
 }
 
@@ -184,8 +189,132 @@ bool load_remote(HANDLE proc, const wchar_t* name, std::uintptr_t& out_module) {
     return ok && loaded;
 }
 
-bool apply_imports(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,
-                   std::size_t image_size) {
+// Le CRT appelle RtlPcToFileHeader pour retrouver l'ImageBase. Sans entree dans
+// l'InvertedFunctionTable il renvoie 0 et le CRT plante. On detourne l'import.
+bool patch_pc_to_file_header(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,
+                             std::size_t image_size) {
+    const auto real = reinterpret_cast<std::uintptr_t>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "RtlPcToFileHeader"));
+    if (!real) { std::fprintf(stderr, "[trace] RtlPcToFileHeader introuvable\n"); return true; }
+
+    const auto* imports = directory(image, image_size, IMAGE_DIRECTORY_ENTRY_IMPORT);
+    if (!imports || !imports->Size) return true;
+
+    std::vector<std::uint8_t> stub;
+    auto push_imm64 = [&](std::uint8_t rex, std::uint8_t op, std::uintptr_t value) {
+        stub.push_back(rex); stub.push_back(op);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(&value);
+        stub.insert(stub.end(), p, p + sizeof(value));
+    };
+
+    stub.push_back(0x49); stub.push_back(0x89); stub.push_back(0xC9);          // mov r9, rcx
+    push_imm64(0x49, 0xB8, base);                                             // mov r8, base
+    stub.push_back(0x4C); stub.push_back(0x29); stub.push_back(0xC9);          // sub r9, r8
+    stub.push_back(0x49); stub.push_back(0x81); stub.push_back(0xF9);          // cmp r9, size
+    const auto size32 = static_cast<std::uint32_t>(image_size);
+    const auto* s = reinterpret_cast<const std::uint8_t*>(&size32);
+    stub.insert(stub.end(), s, s + sizeof(size32));
+    stub.push_back(0x73); stub.push_back(0x07);                               // jae fin
+    stub.push_back(0x4C); stub.push_back(0x89); stub.push_back(0x02);          // mov [rdx], r8
+    stub.push_back(0x4C); stub.push_back(0x89); stub.push_back(0xC0);          // mov rax, r8
+    stub.push_back(0xC3);                                                     // ret
+    push_imm64(0x49, 0xB8, real);                                             // mov r8, real
+    stub.push_back(0x41); stub.push_back(0xFF); stub.push_back(0xE0);          // jmp r8
+
+    const auto remote = alloc_mem(proc, stub.size(), PAGE_EXECUTE_READWRITE);
+    if (!remote) return false;
+    if (!write_mem(proc, remote, stub.data(), stub.size())) return false;
+
+    std::size_t patched = 0;
+    const auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+        image + imports->VirtualAddress);
+
+    for (; descriptor->Name; ++descriptor) {
+        const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(image + descriptor->FirstThunk);
+        std::uintptr_t slot = base + descriptor->FirstThunk;
+
+        for (; thunk->u1.AddressOfData; ++thunk, slot += sizeof(std::uint64_t)) {
+            if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                image + thunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), "RtlPcToFileHeader") != 0)
+                continue;
+
+            if (!write_value(proc, slot, remote)) return false;
+            ++patched;
+        }
+    }
+
+    std::fprintf(stderr, "[trace] RtlPcToFileHeader detourne (%zu emplacement)\n", patched);
+    return true;
+}
+using FnHandleTls = LONG(NTAPI*)(PVOID);
+using FnAddFunctionTable = BOOLEAN(NTAPI*)(PRUNTIME_FUNCTION, DWORD, DWORD64);
+
+// Enregistre la table d'exceptions .pdata : sans elle, le moindre unwind tue le thread.
+bool register_exceptions(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,
+                         std::size_t image_size) {
+    const auto* dir = directory(image, image_size, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+    if (!dir || !dir->Size) { std::fprintf(stderr, "[trace] pas de .pdata\n"); return true; }
+    if (static_cast<std::size_t>(dir->VirtualAddress) + dir->Size > image_size) return false;
+
+    const auto add_table = reinterpret_cast<FnAddFunctionTable>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlAddFunctionTable"));
+    if (!add_table) return false;
+
+    const auto remote = alloc_mem(proc, dir->Size, PAGE_READWRITE);
+    if (!remote) return false;
+    if (!write_mem(proc, remote, image + dir->VirtualAddress, dir->Size)) return false;
+
+    const DWORD count = dir->Size / sizeof(RUNTIME_FUNCTION);
+    std::uintptr_t ignored = 0;
+    const bool ok = hijack_call(proc, reinterpret_cast<std::uintptr_t>(add_table),
+                                remote, count, base, &ignored);
+    std::fprintf(stderr, "[trace] table d'exceptions: %lu entrees, appel distant=%d\n", count, ok ? 1 : 0);
+    return ok;
+}
+
+// Alloue les slots TLS puis appelle les callbacks TLS du module.
+bool run_tls(HANDLE proc, std::uintptr_t base, std::uintptr_t preferred,
+             const std::uint8_t* image, std::size_t image_size) {
+    const auto* dir = directory(image, image_size, IMAGE_DIRECTORY_ENTRY_TLS);
+    if (!dir || !dir->Size) { std::fprintf(stderr, "[trace] pas de TLS\n"); return true; }
+    if (static_cast<std::size_t>(dir->VirtualAddress) + sizeof(IMAGE_TLS_DIRECTORY64) > image_size)
+        return false;
+
+    IMAGE_TLS_DIRECTORY64 tls{};
+    std::memcpy(&tls, image + dir->VirtualAddress, sizeof(tls));
+
+    const auto handle_tls = reinterpret_cast<FnHandleTls>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrpHandleTlsData"));
+    if (handle_tls) {
+        std::uintptr_t ignored = 0;
+        const bool ok = hijack_call(proc, reinterpret_cast<std::uintptr_t>(handle_tls),
+                                    base, 0, 0, &ignored);
+        std::fprintf(stderr, "[trace] LdrpHandleTlsData -> %d\n", ok ? 1 : 0);
+    }
+
+    if (!tls.AddressOfCallBacks) return true;
+
+    const auto list_rva = static_cast<std::size_t>(tls.AddressOfCallBacks - preferred);
+    if (list_rva + sizeof(std::uint64_t) > image_size) return false;
+
+    for (std::size_t i = 0; i < 64; ++i) {
+        std::uint64_t callback = 0;
+        const auto slot = list_rva + i * sizeof(std::uint64_t);
+        if (slot + sizeof(std::uint64_t) > image_size) break;
+        std::memcpy(&callback, image + slot, sizeof(callback));
+        if (!callback) break;
+
+        const auto target = base + static_cast<std::uintptr_t>(callback - preferred);
+        std::uintptr_t ignored = 0;
+        hijack_call(proc, target, base, 1, 0, &ignored);
+        std::fprintf(stderr, "[trace] callback TLS %zu appele\n", i);
+    }
+    return true;
+}
+
+bool apply_imports(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,                   std::size_t image_size) {
     const auto* imports = directory(image, image_size, IMAGE_DIRECTORY_ENTRY_IMPORT);
     if (!imports || !imports->Size) return true;
     if (static_cast<std::size_t>(imports->VirtualAddress) + sizeof(IMAGE_IMPORT_DESCRIPTOR) > image_size)
@@ -215,7 +344,11 @@ bool apply_imports(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,
 
         if (!module) {
             std::fprintf(stderr, "[trace] chargement distant : %s\n", module_name);
-            load_remote(proc, wide, module);
+            if (!load_remote(proc, wide, module) && !g_dll_dir.empty()) {
+                const auto full = (g_dll_dir / module_name).wstring();
+                std::fprintf(stderr, "[trace] essai par chemin: %ls\n", full.c_str());
+                load_remote(proc, full.c_str(), module);
+            }
         }
 
         if (!module) {
@@ -254,6 +387,7 @@ bool apply_imports(HANDLE proc, std::uintptr_t base, const std::uint8_t* image,
 MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll,
                      bool wipe_headers) {
     MapResult result;
+    g_dll_dir = dll.parent_path();
     result.stage = "lecture";
 
     const auto file = read_file(dll);
@@ -293,6 +427,15 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
         result.error = "resolution d'imports echouee"; return result;
     }
     std::fprintf(stderr, "[trace] imports ok\n");
+    if (!patch_pc_to_file_header(proc.handle, base, image.data(), image.size())) return result;
+
+    result.stage = "tls";
+    if (!register_exceptions(proc.handle, base, image.data(), image.size())) {
+        result.error = "enregistrement des exceptions echoue"; return result;
+    }
+    if (!run_tls(proc.handle, base, preferred, image.data(), image.size())) {
+        result.error = "initialisation TLS echouee"; return result;
+    }
 
     result.stage = "protections";
     auto* section = IMAGE_FIRST_SECTION(nt);
@@ -308,10 +451,184 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
                     section->SizeOfRawData, protection, &previous);
     }
 
+    std::fprintf(stderr, "[trace] entree rva=0x%X base=0x%llX", nt->OptionalHeader.AddressOfEntryPoint, (unsigned long long)base); std::fprintf(stderr, "\n");
     result.stage = "hijack";
+    std::uintptr_t veh_report = 0;
+    {
+        const auto add_veh = reinterpret_cast<std::uintptr_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlAddVectoredExceptionHandler"));
+        veh_report = alloc_mem(proc.handle, 0x20, PAGE_READWRITE);
+
+        std::vector<std::uint8_t> handler;
+        auto imm = [&](std::uintptr_t value) {
+            handler.push_back(0x48); handler.push_back(0xB8);
+            const auto* p = reinterpret_cast<const std::uint8_t*>(&value);
+            handler.insert(handler.end(), p, p + sizeof(value));
+        };
+        // magic
+        imm(veh_report); handler.push_back(0xC7); handler.push_back(0x00);
+        handler.push_back(0xEF); handler.push_back(0xBE); handler.push_back(0xAD); handler.push_back(0xDE);
+        // context
+        const std::uint8_t a[] = { 0x48, 0x8B, 0x41, 0x08, 0x48, 0x8B, 0x90, 0xF8, 0x00, 0x00, 0x00 };
+        handler.insert(handler.end(), a, a + sizeof(a));
+        imm(veh_report + 8); handler.push_back(0x48); handler.push_back(0x89); handler.push_back(0x10);
+        // code
+        const std::uint8_t c[] = { 0x48, 0x8B, 0x01, 0x8B, 0x00 };
+        handler.insert(handler.end(), c, c + sizeof(c));
+        imm(veh_report + 16); handler.push_back(0x89); handler.push_back(0x00);
+        handler.push_back(0x48); handler.push_back(0x8B); handler.push_back(0x41); handler.push_back(0x08);
+        handler.push_back(0x48); handler.push_back(0x8B); handler.push_back(0x90);
+        handler.push_back(0x98); handler.push_back(0x00); handler.push_back(0x00); handler.push_back(0x00);
+        imm(veh_report + 24); handler.push_back(0x48); handler.push_back(0x89); handler.push_back(0x10);
+        const std::uint8_t z[] = { 0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3 };
+        handler.insert(handler.end(), z, z + sizeof(z));
+
+        const auto buffer = alloc_mem(proc.handle, handler.size(), PAGE_EXECUTE_READWRITE);
+        if (buffer && add_veh) {
+            write_mem(proc.handle, buffer, handler.data(), handler.size());
+            std::uintptr_t ignored = 0;
+            hijack_call(proc.handle, add_veh, 1, buffer, 0, &ignored);
+            std::fprintf(stderr, "[trace] veh installe\n");
+        }
+    }
+
     auto hijack = hijack_thread(proc.handle, base, base + nt->OptionalHeader.AddressOfEntryPoint);
-    if (!hijack) { result.error = "hijack de thread echoue"; return result; }
-    if (!hijack.done) { result.error = "DllMain n'a pas rendu la main"; return result; }
+    if (!hijack.done) {
+        std::uint32_t magic = 0, fault_code = 0;
+        std::uintptr_t fault_rip = 0;
+        if (veh_report) {
+            read_value(proc.handle, veh_report, magic);
+            read_value(proc.handle, veh_report + 8, fault_rip);
+            read_value(proc.handle, veh_report + 16, fault_code);
+        }
+        unsigned char entry_bytes[16]{};
+        read_mem(proc.handle, base + nt->OptionalHeader.AddressOfEntryPoint, entry_bytes, sizeof(entry_bytes));
+        std::fprintf(stderr, "[trace] entree:");
+        for (unsigned char b : entry_bytes) std::fprintf(stderr, " %02X", b);
+        std::fprintf(stderr, "\n");
+        auto nearest_name = [&](std::uintptr_t module, std::uintptr_t address) -> std::wstring {
+            IMAGE_DOS_HEADER dos{};
+            if (!read_value(proc.handle, module, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) return L"";
+            IMAGE_NT_HEADERS64 nt2{};
+            if (!read_value(proc.handle, module + dos.e_lfanew, nt2)) return L"";
+
+            const auto& dir = nt2.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (!dir.VirtualAddress) return L"";
+
+            IMAGE_EXPORT_DIRECTORY ex{};
+            if (!read_value(proc.handle, module + dir.VirtualAddress, ex)) return L"";
+            if (!ex.NumberOfFunctions || !ex.NumberOfNames) return L"";
+
+            std::vector<std::uint32_t> funcs(ex.NumberOfFunctions);
+            if (!read_mem(proc.handle, module + ex.AddressOfFunctions,
+                          funcs.data(), funcs.size() * sizeof(std::uint32_t))) return L"";
+
+            const auto target_rva = static_cast<std::uint32_t>(address - module);
+            std::size_t best = funcs.size();
+            for (std::size_t i = 0; i < funcs.size(); ++i)
+                if (funcs[i] && funcs[i] <= target_rva && (best == funcs.size() || funcs[i] > funcs[best]))
+                    best = i;
+            if (best == funcs.size()) return L"";
+
+            std::vector<std::uint32_t> names(ex.NumberOfNames);
+            std::vector<std::uint16_t> ordinals(ex.NumberOfNames);
+            if (!read_mem(proc.handle, module + ex.AddressOfNames,
+                          names.data(), names.size() * sizeof(std::uint32_t))) return L"";
+            if (!read_mem(proc.handle, module + ex.AddressOfNameOrdinals,
+                          ordinals.data(), ordinals.size() * sizeof(std::uint16_t))) return L"";
+
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                if (ordinals[i] != best) continue;
+                char buffer[200]{};
+                if (!read_mem(proc.handle, module + names[i], buffer, sizeof(buffer) - 1)) continue;
+                wchar_t wide[200]{};
+                MultiByteToWideChar(CP_ACP, 0, buffer, -1, wide, 200);
+                wchar_t out[260];
+                swprintf_s(out, L"%s+0x%X", wide, target_rva - funcs[best]);
+                return out;
+            }
+            return L"";
+        };
+
+        auto nearest_name2 = [&](std::uintptr_t module, std::uintptr_t address) -> std::wstring {
+            IMAGE_DOS_HEADER dos{};
+            if (!read_value(proc.handle, module, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) return L"";
+            IMAGE_NT_HEADERS64 nt2{};
+            if (!read_value(proc.handle, module + dos.e_lfanew, nt2)) return L"";
+
+            const auto& dir = nt2.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (!dir.VirtualAddress) return L"";
+
+            IMAGE_EXPORT_DIRECTORY ex{};
+            if (!read_value(proc.handle, module + dir.VirtualAddress, ex)) return L"";
+            if (!ex.NumberOfFunctions || !ex.NumberOfNames) return L"";
+
+            std::vector<std::uint32_t> funcs(ex.NumberOfFunctions);
+            if (!read_mem(proc.handle, module + ex.AddressOfFunctions,
+                          funcs.data(), funcs.size() * sizeof(std::uint32_t))) return L"";
+
+            const auto target_rva = static_cast<std::uint32_t>(address - module);
+            std::size_t best = funcs.size();
+            for (std::size_t i = 0; i < funcs.size(); ++i)
+                if (funcs[i] && funcs[i] <= target_rva && (best == funcs.size() || funcs[i] > funcs[best]))
+                    best = i;
+            if (best == funcs.size()) return L"";
+
+            std::vector<std::uint32_t> names(ex.NumberOfNames);
+            std::vector<std::uint16_t> ordinals(ex.NumberOfNames);
+            if (!read_mem(proc.handle, module + ex.AddressOfNames,
+                          names.data(), names.size() * sizeof(std::uint32_t))) return L"";
+            if (!read_mem(proc.handle, module + ex.AddressOfNameOrdinals,
+                          ordinals.data(), ordinals.size() * sizeof(std::uint16_t))) return L"";
+
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                if (ordinals[i] != best) continue;
+                char buffer[200]{};
+                if (!read_mem(proc.handle, module + names[i], buffer, sizeof(buffer) - 1)) continue;
+                wchar_t wide[200]{};
+                MultiByteToWideChar(CP_ACP, 0, buffer, -1, wide, 200);
+                wchar_t out[260];
+                swprintf_s(out, L"%s+0x%X", wide, target_rva - funcs[best]);
+                return out;
+            }
+            return L"";
+        };
+
+        auto describe = [&](std::uintptr_t address) -> std::wstring {
+            const auto snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, proc.pid);
+            if (snap == INVALID_HANDLE_VALUE) return L"?";
+            std::wstring out = L"?";
+            MODULEENTRY32W me{}; me.dwSize = sizeof(me);
+            if (Module32FirstW(snap, &me)) {
+                do {
+                    const auto mb = reinterpret_cast<std::uintptr_t>(me.modBaseAddr);
+                    if (address >= mb && address < mb + me.modBaseSize) {
+                        const auto named = nearest_name(mb, address);
+                        wchar_t raw[200];
+                        swprintf_s(raw, L"%s+0x%llX", me.szModule, (unsigned long long)(address - mb));
+                        out = named.empty() ? std::wstring(raw) : (std::wstring(named) + L" [" + raw + L"]");
+                        break;
+                    }
+                } while (Module32NextW(snap, &me));
+            }
+            CloseHandle(snap);
+            return out;
+        };        std::fprintf(stderr, "[trace] magic=0x%X code=0x%X rip=%ls entree=0x%llX\n",
+                     magic, fault_code, describe(fault_rip).c_str(),
+                     (unsigned long long)(base + nt->OptionalHeader.AddressOfEntryPoint));
+
+        std::uintptr_t fault_rsp = 0;
+        read_value(proc.handle, veh_report + 24, fault_rsp);
+        std::fprintf(stderr, "[trace] rsp=0x%llX\n", (unsigned long long)fault_rsp);
+        if (fault_rsp) {
+            std::uintptr_t frames[10]{};
+            read_mem(proc.handle, fault_rsp, frames, sizeof(frames));
+            for (std::uintptr_t frame : frames) {
+                if (frame) std::fprintf(stderr, "[trace]   pile: %ls\n", describe(frame).c_str());
+            }
+        }
+        result.error = "DllMain n'a pas rendu la main"; return result;
+    }
     std::fprintf(stderr, "[trace] dllmain rendu la main\n");
 
     unlink_from_peb(proc.handle, hijack.thread, base);
@@ -329,3 +646,18 @@ MapResult manual_map(const ProcessHandle& proc, const std::filesystem::path& dll
 }
 
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
