@@ -12,3 +12,4 @@ add_subdirectory(src/launcher)
 add_subdirectory(tests/payload)
 
 add_subdirectory(tests/raw)
+add_subdirectory(tests/spin)

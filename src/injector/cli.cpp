@@ -1,21 +1,24 @@
 ﻿#include "manual_map.hpp"
 #include "process.hpp"
+#include "thread_hijack.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 
 int wmain(int argc, wchar_t** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
 
     if (argc < 2) {
-        std::printf("usage: lunar_inject_cli <dll> [--exe nom.exe] [--pid n] [--wipe]\n");
+        std::printf("usage: lunar_inject_cli <dll|--selftest> [--exe nom.exe] [--pid n] [--wipe]\n");
         return 1;
     }
 
-    const std::wstring dll = argv[1];
+    std::wstring dll = argv[1];
     std::wstring exe = L"RobloxPlayerBeta.exe";
     std::uint32_t pid = 0;
     bool wipe = false;
+    bool selftest = dll == L"--selftest";
 
     for (int i = 2; i < argc; ++i) {
         const std::wstring arg = argv[i];
@@ -31,6 +34,17 @@ int wmain(int argc, wchar_t** argv) {
     if (!process) { std::printf("ouverture du pid %u refusee\n", pid); return 1; }
 
     std::printf("cible pid %u\n", pid);
+
+    if (selftest) {
+        const auto fn = reinterpret_cast<std::uintptr_t>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentProcessId"));
+        std::uintptr_t remote_pid = 0;
+        const bool ok = lunar::injector::hijack_call(process.handle, fn, 0, 0, 0, &remote_pid);
+        std::printf("selftest: appel=%d valeur=%llu attendu=%u\n", ok ? 1 : 0,
+                    static_cast<unsigned long long>(remote_pid), pid);
+        return ok && remote_pid == pid ? 0 : 1;
+    }
+
     const auto result = lunar::injector::manual_map(process, dll, wipe);
 
     if (!result) {

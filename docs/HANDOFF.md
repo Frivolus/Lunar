@@ -81,3 +81,11 @@ Brique 1 : patch `thread_hijack.cpp` (chemins d'erreur, duree de vie du stub, li
 - Echec observe : `DllMain n'a pas rendu la main`. Le VEH de diagnostic est en place pour capturer code/rip/rsp/pile.
 - Prochain test : payload brut dans notepad.exe. Si le brut passe et le CRT non, c'est l'initialisation CRT. Si les deux echouent, c'est le mapper.
 - Les payloads de test ecrivent desormais en dur : `C:\dev\lunar_payload_ok.txt` et `%TEMP%\lunar_raw_ok.txt`.
+
+## Mise a jour 09/11/2026 (2)
+
+- Cause du timeout trouvee : le thread hijacke etait bloque dans un wait noyau (thread principal de cmd.exe en attente clavier). Le RIP injecte ne prend effet qu'au retour en mode utilisateur, jamais atteint.
+- Preuve : selftest sur cible a thread actif (`lunar_spin`) -> succes, valeur correcte.
+- Injection complete du payload brut sur `lunar_spin` : mappe, DllMain execute, marqueur ecrit, unlink PEB, cible vivante.
+- Le mapper, le stub, NtContinue, les imports et les exceptions fonctionnent.
+- Reste : payload CRT, puis selection de thread robuste (ignorer les threads bloques).

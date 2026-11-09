@@ -29,6 +29,8 @@ std::vector<std::uint8_t> build_stub(std::uintptr_t fn, std::uintptr_t a1, std::
     std::vector<std::uint8_t> code;
     code.reserve(128);
 
+    emit_imm64(code, 0x48, 0xB8, flag);
+    emit(code, { 0xC7, 0x00, 0x02, 0x00, 0x00, 0x00 });
     emit(code, { 0x48, 0x83, 0xE4, 0xF0 });
     emit(code, { 0x48, 0x83, 0xEC, 0x20 });
     emit_imm64(code, 0x48, 0xB9, a1);
@@ -71,6 +73,14 @@ HANDLE pick_thread(std::uint32_t pid) {
     return chosen;
 }
 
+void resume_fully(HANDLE thread) {
+    for (int guard = 0; guard < 64; ++guard) {
+        const DWORD previous = ResumeThread(thread);
+        if (previous == static_cast<DWORD>(-1)) return;
+        if (previous == 0) return;
+    }
+}
+
 void abort_hijack(Hijack& out, bool suspended) {
     if (out.thread) {
         if (suspended) {
@@ -80,7 +90,7 @@ void abort_hijack(Hijack& out, bool suspended) {
                 if (read_mem(out.proc, out.context, &original, sizeof(original)))
                     SetThreadContext(out.thread, &original);
             }
-            ResumeThread(out.thread);
+            resume_fully(out.thread);
         }
         CloseHandle(out.thread);
         out.thread = nullptr;
@@ -98,7 +108,7 @@ bool wait_left_stub(Hijack& out) {
             CONTEXT current{};
             current.ContextFlags = CONTEXT_CONTROL;
             known = GetThreadContext(out.thread, &current) != FALSE;
-            ResumeThread(out.thread);
+            resume_fully(out.thread);
 
             if (known) outside = current.Rip < out.stub || current.Rip >= out.stub + out.stub_size;
         }
@@ -119,7 +129,8 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
     out.thread = pick_thread(GetProcessId(proc));
     if (!out.thread) { std::fprintf(stderr, "[trace] appel: aucun thread\n"); return false; }
 
-    if (SuspendThread(out.thread) == static_cast<DWORD>(-1)) {
+    const DWORD susp = SuspendThread(out.thread);
+    if (susp == static_cast<DWORD>(-1)) {
         std::fprintf(stderr, "[trace] appel: suspend echec\n");
         abort_hijack(out, false);
         return false;
@@ -161,6 +172,9 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
         return false;
     }
     out.stub_size = code.size();
+    std::fprintf(stderr, "[trace] stub %zu octets:", code.size());
+    for (auto b : code) std::fprintf(stderr, " %02X", b);
+    std::fprintf(stderr, "\n");
     if (!write_mem(proc, out.stub, code.data(), code.size())) {
         abort_hijack(out, suspended);
         return false;
@@ -169,12 +183,15 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
     CONTEXT hijacked = original;
     hijacked.Rip = static_cast<DWORD64>(out.stub);
     if (!SetThreadContext(out.thread, &hijacked)) {
-        std::fprintf(stderr, "[trace] appel: setcontext echec\n");
+        std::fprintf(stderr, "[trace] appel: setcontext echec (%lu)\n", GetLastError());
         abort_hijack(out, suspended);
         return false;
     }
 
-    ResumeThread(out.thread);
+    std::fprintf(stderr, "[trace] rip original=0x%llX stub=0x%llX susp=%lu\n",
+                 (unsigned long long)original.Rip, (unsigned long long)out.stub,
+                 (unsigned long)susp);
+    resume_fully(out.thread);
     suspended = false;
 
     bool done = false;
@@ -186,6 +203,27 @@ bool run_stub(HANDLE proc, std::uintptr_t fn, std::uintptr_t a1, std::uintptr_t 
 
     if (!done) {
         std::fprintf(stderr, "[trace] appel: timeout\n");
+        std::uint32_t raw_flag = 0xFFFFFFFF;
+        std::uintptr_t raw_slot = 0;
+        const auto st_flag = nt::api().read_virtual_memory(
+            proc, reinterpret_cast<void*>(out.flag), &raw_flag, sizeof(raw_flag), nullptr);
+        const auto st_slot = nt::api().read_virtual_memory(
+            proc, reinterpret_cast<void*>(out.slot), &raw_slot, sizeof(raw_slot), nullptr);
+        std::fprintf(stderr, "[trace] flag=0x%X (st=0x%lX) slot=0x%llX (st=0x%lX)\n",
+                     raw_flag, (unsigned long)st_flag, (unsigned long long)raw_slot,
+                     (unsigned long)st_slot);
+        DWORD exit_code = 0;
+        GetExitCodeThread(out.thread, &exit_code);
+        std::fprintf(stderr, "[trace] thread exit=0x%lX (259 = vivant)\n", (unsigned long)exit_code);
+        const DWORD susp2 = SuspendThread(out.thread);
+        if (susp2 != static_cast<DWORD>(-1)) {
+            CONTEXT now{};
+            now.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(out.thread, &now))
+                std::fprintf(stderr, "[trace] rip au timeout=0x%llX susp=%lu\n",
+                             (unsigned long long)now.Rip, (unsigned long)susp2);
+            resume_fully(out.thread);
+        }
         out.keep_remote = true;
         if (out_value) read_value(proc, out.slot, *out_value);
         return false;
@@ -265,7 +303,8 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
     out.thread = pick_thread(GetProcessId(proc));
     if (!out.thread) return out;
 
-    if (SuspendThread(out.thread) == static_cast<DWORD>(-1)) {
+    const DWORD susp = SuspendThread(out.thread);
+    if (susp == static_cast<DWORD>(-1)) {
         abort_hijack(out, false);
         return out;
     }
@@ -297,13 +336,19 @@ Hijack hijack_thread(HANDLE proc, std::uintptr_t module_base, std::uintptr_t ent
     out.stub = alloc_mem(proc, code.size(), PAGE_EXECUTE_READWRITE);
     if (!out.stub) { abort_hijack(out, suspended); return out; }
     out.stub_size = code.size();
+    std::fprintf(stderr, "[trace] stub %zu octets:", code.size());
+    for (auto b : code) std::fprintf(stderr, " %02X", b);
+    std::fprintf(stderr, "\n");
     if (!write_mem(proc, out.stub, code.data(), code.size())) { abort_hijack(out, suspended); return out; }
 
     CONTEXT hijacked = original;
     hijacked.Rip = static_cast<DWORD64>(out.stub);
     if (!SetThreadContext(out.thread, &hijacked)) { abort_hijack(out, suspended); return out; }
 
-    ResumeThread(out.thread);
+    std::fprintf(stderr, "[trace] rip original=0x%llX stub=0x%llX susp=%lu\n",
+                 (unsigned long long)original.Rip, (unsigned long long)out.stub,
+                 (unsigned long)susp);
+    resume_fully(out.thread);
     suspended = false;
 
     for (DWORD waited = 0; waited < kTimeoutMs; waited += 10) {

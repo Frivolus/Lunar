@@ -6,28 +6,31 @@
 ## Position
 
 - Phase : 0 — fondations
-- Derniere action : WIP de debug commite (TLS, exceptions, detour RtlPcToFileHeader, VEH diagnostic, payload brut /NODEFAULTLIB)
-- Prochaine action : injecter le payload brut dans notepad.exe pour isoler mapper vs CRT
+- Derniere action : injection bout en bout validee (payload brut, cible `lunar_spin`), DllMain execute, marqueur ecrit, unlink PEB fait
+- Prochaine action : valider le payload CRT, puis rendre la selection de thread robuste aux threads bloques
 
 ## Fait
 
-- [x] Repo prive cree
-- [x] Arborescence src/ injector / hyperion / core / launcher
-- [x] CMake racine + sous-projets vides
-- [x] .gitignore Visual Studio + CMake
+- [x] Repo prive cree, arborescence, CMake, .gitignore
 - [x] `src/injector` ecrit, compile
 - [x] Chemins d'erreur hijack + duree de vie du stub
 - [x] Relocations, imports, remap API-set, chargement d'import par chemin
 - [x] Table d'exceptions (.pdata) via RtlAddFunctionTable
 - [x] TLS : LdrpHandleTlsData + callbacks manuels
 - [x] Detour RtlPcToFileHeader
-- [x] VEH de diagnostic : code, rip, rsp, pile, nom de l'export le plus proche
-- [x] Payload de test CRT et payload brut /NODEFAULTLIB
+- [x] VEH de diagnostic
+- [x] `--selftest` : hijack de GetCurrentProcessId, valeur remontee correcte
+- [x] Cible de test `lunar_spin` (thread jamais bloque)
+- [x] Injection complete du payload brut : DllMain, marqueur, unlink PEB
+
+## Limite connue
+
+Un thread bloque dans un wait noyau (ex. thread principal de `cmd.exe` en attente clavier) ne reprend pas le `RIP` injecte : le changement ne prend effet qu'au retour en mode utilisateur, qui n'arrive pas. Il faut choisir un thread actif ou le reveiller.
 
 ## A faire (ordre impose)
 
-- [ ] Isoler l'echec : payload brut vs payload CRT sur notepad.exe
-- [ ] Corriger la cause du fault a l'entree
+- [ ] Payload CRT sur `lunar_spin`
+- [ ] Selection de thread robuste : ignorer les threads bloques, essayer les suivants
 - [ ] `src/hyperion` : snapshot pages, hook VirtualProtect, anti-debug
 - [ ] `src/core` : VM Luau, ScriptContext, identity 7
 - [ ] `src/core/api` : 86 fonctions sUNC
@@ -50,8 +53,10 @@
 | 30/10/2026 | Repo prive, nom `Lunar` | Pas de fuite, marque courte |
 | 30/10/2026 | Payload en 3 binaires (emulator / executor / data) | Patch offsets sans recompiler le signe |
 | 30/10/2026 | Injection avant init hyperviseur | Restaurer les hashes apres coup est trop tardif |
-| 09/11/2026 | Memoire de travail dans `docs/HANDOFF.md` | Survivre aux compressions de conversation |
+| 09/11/2026 | Memoire de travail dans `docs/HANDOFF.md` | Survivre aux compressions |
 | 09/11/2026 | Payload brut `/NODEFAULTLIB` comme outil de bisection | Separer un mapper casse d'un CRT non initialise |
+| 09/11/2026 | Cible de test `lunar_spin` a thread jamais bloque | Isoler le mapper des threads en wait noyau |
+| 09/11/2026 | Voie 1 retenue : rester autonome, pas d'API WeAreDevs | Controle total, x64 |
 
 ## Journal
 
@@ -61,3 +66,4 @@
 - 30/10/2026 : fix signature hijack_call.
 - 09/11/2026 : chemins d'erreur hijack, duree de vie du stub.
 - 09/11/2026 : TLS, exceptions, detour RtlPcToFileHeader, VEH diagnostic, payload brut.
+- 09/11/2026 : cause du timeout identifiee (thread bloque), selftest ajoute, injection bout en bout OK.
